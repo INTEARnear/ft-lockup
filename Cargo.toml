@@ -3,6 +3,7 @@ name = "ft-lockup"
 version = "0.1.0"
 edition = "2024"
 resolver = "3"
+repository = "https://github.com/INTEARnear/ft-lockup"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
