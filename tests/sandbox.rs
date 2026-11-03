@@ -464,8 +464,8 @@ async fn transfer_with_mismatched_sum_or_unregistered_account_is_refunded() {
         .assert_success();
 
     for msg in [
-        format!(r#"[["{}",99]]"#, env.alice),
-        format!(r#"[["{}",30],["bob.sandbox",70]]"#, env.alice),
+        json!([[env.alice, "99"]]).to_string(),
+        json!([[env.alice, "30"], ["bob.sandbox", "70"]]).to_string(),
     ] {
         env.call(
             &env.alice,
