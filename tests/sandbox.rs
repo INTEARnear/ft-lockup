@@ -204,6 +204,15 @@ impl TestEnv {
         .await
     }
 
+    async fn alice_is_frozen(&self) -> bool {
+        self.view(
+            &self.lockup,
+            "is_frozen",
+            json!({ "account_id": self.alice }),
+        )
+        .await
+    }
+
     async fn set_unlock_period(
         &self,
         caller: &AccountId,
@@ -401,4 +410,115 @@ async fn failed_withdraw_transfer_restores_balance() {
         env.alice_lockup_account().await.unwrap().deposited,
         U128(DEPOSIT_AMOUNT)
     );
+}
+
+#[tokio::test]
+async fn transfer_with_msg_locks_amounts_for_each_account() {
+    let env = TestEnv::new().await;
+    let bob: AccountId = "bob.sandbox".parse().unwrap();
+    env.alice_call_lockup("register", STORAGE_DEPOSIT)
+        .await
+        .assert_success();
+    env.call(
+        &env.alice,
+        &env.lockup,
+        "register",
+        json!({ "account_id": bob }),
+        STORAGE_DEPOSIT,
+    )
+    .await
+    .assert_success();
+
+    env.call(
+        &env.alice,
+        &env.token,
+        "ft_transfer_call",
+        json!({
+            "receiver_id": env.lockup,
+            "amount": U128(DEPOSIT_AMOUNT),
+            "msg": json!([[env.alice,"30"],[bob,"70"]]).to_string(),
+        }),
+        ONE_YOCTO,
+    )
+    .await
+    .assert_success();
+
+    assert_eq!(
+        env.alice_token_balance().await,
+        TOTAL_SUPPLY - DEPOSIT_AMOUNT
+    );
+    assert_eq!(env.alice_lockup_account().await.unwrap().locked, U128(30));
+    let bob_account: Option<Account> = env
+        .view(&env.lockup, "get_account", json!({ "account_id": bob }))
+        .await;
+    assert_eq!(bob_account.unwrap().locked, U128(70));
+    let total_locked: U128 = env.view(&env.lockup, "get_total_locked", json!({})).await;
+    assert_eq!(total_locked, U128(DEPOSIT_AMOUNT));
+}
+
+#[tokio::test]
+async fn transfer_with_mismatched_sum_or_unregistered_account_is_refunded() {
+    let env = TestEnv::new().await;
+    env.alice_call_lockup("register", STORAGE_DEPOSIT)
+        .await
+        .assert_success();
+
+    for msg in [
+        format!(r#"[["{}",99]]"#, env.alice),
+        format!(r#"[["{}",30],["bob.sandbox",70]]"#, env.alice),
+    ] {
+        env.call(
+            &env.alice,
+            &env.token,
+            "ft_transfer_call",
+            json!({ "receiver_id": env.lockup, "amount": U128(DEPOSIT_AMOUNT), "msg": msg }),
+            ONE_YOCTO,
+        )
+        .await
+        .assert_success();
+    }
+
+    assert_eq!(env.alice_token_balance().await, TOTAL_SUPPLY);
+    assert_eq!(
+        env.alice_lockup_account().await.unwrap(),
+        Account::default()
+    );
+}
+
+#[tokio::test]
+async fn frozen_account_cannot_withdraw_until_unfrozen() {
+    let env = TestEnv::new().await;
+    env.alice_call_lockup("register", STORAGE_DEPOSIT)
+        .await
+        .assert_success();
+    env.alice_deposits_to_lockup().await;
+
+    let set_alice_frozen = async |caller: &AccountId, frozen: bool| {
+        env.call(
+            caller,
+            &env.lockup,
+            "set_frozen",
+            json!({ "account_id": env.alice, "frozen": frozen }),
+            NearToken::from_yoctonear(0),
+        )
+        .await
+    };
+    set_alice_frozen(&env.alice, false).await.assert_failure();
+    set_alice_frozen(&env.lockup, true).await.assert_success();
+    assert!(env.alice_is_frozen().await);
+
+    let failure = env
+        .alice_call_lockup("withdraw", ONE_YOCTO)
+        .await
+        .assert_failure();
+    assert!(
+        failure.to_string().contains("Account is frozen"),
+        "{failure}"
+    );
+
+    set_alice_frozen(&env.lockup, false).await.assert_success();
+    env.alice_call_lockup("withdraw", ONE_YOCTO)
+        .await
+        .assert_success();
+    assert_eq!(env.alice_token_balance().await, TOTAL_SUPPLY);
 }

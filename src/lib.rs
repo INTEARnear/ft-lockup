@@ -3,7 +3,7 @@ use std::time::Duration;
 use near_contract_standards::fungible_token::core::ext_ft_core;
 use near_contract_standards::fungible_token::receiver::FungibleTokenReceiver;
 use near_sdk::json_types::{U64, U128};
-use near_sdk::store::LookupMap;
+use near_sdk::store::{LookupMap, LookupSet};
 use near_sdk::{
     AccountId, BorshStorageKey, Gas, IntoStorageKey, NearToken, PanicOnDefault, Promise,
     PromiseError, PromiseOrValue, assert_one_yocto, env, near, require,
@@ -30,12 +30,14 @@ pub struct Contract {
     accounts: LookupMap<AccountId, Account>,
     unlock_period_ns: u64,
     total_locked: u128,
+    frozen: LookupSet<AccountId>,
 }
 
 #[near(serializers=[borsh])]
 #[derive(BorshStorageKey)]
 enum StorageKey {
     Accounts,
+    Frozen,
 }
 
 const MAX_UNLOCK_PERIOD: Duration = Duration::from_hours(24 * 90);
@@ -54,6 +56,27 @@ impl Contract {
             accounts: LookupMap::new(StorageKey::Accounts),
             unlock_period_ns: unlock_period_ns.0,
             total_locked: 0,
+            frozen: LookupSet::new(StorageKey::Frozen),
+        }
+    }
+
+    #[private]
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        #[near(serializers=[borsh])]
+        pub struct OldContract {
+            token_id: AccountId,
+            accounts: LookupMap<AccountId, Account>,
+            unlock_period_ns: u64,
+            total_locked: u128,
+        }
+        let old_state: OldContract = env::state_read().unwrap();
+        Self {
+            token_id: old_state.token_id,
+            accounts: old_state.accounts,
+            unlock_period_ns: old_state.unlock_period_ns,
+            total_locked: old_state.total_locked,
+            frozen: LookupSet::new(StorageKey::Frozen),
         }
     }
 
@@ -65,6 +88,19 @@ impl Contract {
             "Invalid unlock period"
         );
         self.unlock_period_ns = unlock_period_ns.0;
+    }
+
+    #[private]
+    pub fn set_frozen(&mut self, account_id: AccountId, frozen: bool) {
+        if frozen {
+            self.frozen.insert(account_id);
+        } else {
+            self.frozen.remove(&account_id);
+        }
+    }
+
+    pub fn is_frozen(&self, account_id: AccountId) -> bool {
+        self.frozen.contains(&account_id)
     }
 
     #[payable]
@@ -99,6 +135,7 @@ impl Contract {
     pub fn withdraw(&mut self) -> Promise {
         assert_one_yocto();
         let account_id = env::predecessor_account_id();
+        require!(!self.frozen.contains(&account_id), "Account is frozen");
         let account = self.registered_account_mut(&account_id);
 
         let mut amount_to_withdraw = account.deposited.0;
@@ -200,12 +237,28 @@ impl FungibleTokenReceiver for Contract {
         amount: U128,
         msg: String,
     ) -> PromiseOrValue<U128> {
-        require!(msg.is_empty(), "msg must be empty");
         require!(
             env::predecessor_account_id() == self.token_id,
             "Only the configured token is accepted"
         );
-        self.registered_account_mut(&sender_id).deposited.0 += amount.0;
+        if msg.is_empty() {
+            self.registered_account_mut(&sender_id).deposited.0 += amount.0;
+        } else {
+            let amounts_to_lock: Vec<(AccountId, U128)> = near_sdk::serde_json::from_str(&msg)
+                .unwrap_or_else(|error| env::panic_str(&format!("Invalid msg: {error}")));
+            require!(
+                amounts_to_lock
+                    .iter()
+                    .map(|(_, amount)| amount.0)
+                    .sum::<u128>()
+                    == amount.0,
+                "Amounts in msg must add up to the transferred amount"
+            );
+            for (account_id, amount_to_lock) in amounts_to_lock {
+                self.registered_account_mut(&account_id).locked.0 += amount_to_lock.0;
+            }
+            self.total_locked += amount.0;
+        }
         PromiseOrValue::Value(U128(0))
     }
 }
